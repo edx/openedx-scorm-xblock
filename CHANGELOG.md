@@ -16,6 +16,11 @@ instructions, because git commits are used to generate release notes:
 
 <!-- scriv-insert-here -->
 
+<a id='changelog-19.0.4'></a>
+## v19.0.4 (2026-05-20)
+
+- [Bugfix] Serve SCORM assets at the exact requested path, fixing blank-page rendering for packages containing duplicate basenames such as Articulate Rise packages with multiple `scormdriver.js` files. Also reject path traversal and absolute paths in asset URLs. (by @djoseph)
+
 <a id='changelog-19.0.3'></a>
 ## v19.0.3 (2025-10-27)
 
