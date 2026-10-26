@@ -8,6 +8,7 @@ import zipfile
 import mimetypes
 import urllib
 
+from django.core.cache import cache
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db.models import Q
@@ -392,10 +393,101 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
                             ContentFile(scorm_zipfile.read(zipinfo.filename)),
                         )
 
+    def _rehydrate_extract_folder_if_missing(self):
+        """
+        Self-healing: if our extract folder has no imsmanifest.xml but we know
+        our sha1, search ``scorm_location()`` for another bucket holding the
+        same sha1 directory and copy its tree into our extract folder.
+
+        This covers operations that copy block metadata without touching
+        storage: Studio duplicate and course rerun.
+
+        The result is cached per usage_id and sha1. A miss is cached for an
+        hour, so a block with nothing to copy from doesn't list every SCORM
+        bucket on each view, and a lock keeps concurrent first views from
+        copying the same package in parallel.
+        """
+        # Without the settings service (OLX import/export, block structure
+        # collection) ``storage`` falls back to default_storage, so don't
+        # scan or cache anything from there.
+        if not self.runtime.service(self, "settings"):
+            return
+        sha1 = self.package_meta.get("sha1", "")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha1):
+            return
+        cache_key = f"scorm_xblock:extract_verified:{self.scope_ids.usage_id}:{sha1}"
+        if cache.get(cache_key) is not None:
+            return
+
+        # _copy_storage_tree writes imsmanifest.xml last, so a copy that died
+        # halfway is not taken for a complete one.
+        if self.storage.exists(os.path.join(self.extract_folder_path, "imsmanifest.xml")):
+            cache.set(cache_key, True, timeout=None)
+            return
+
+        lock_key = f"{cache_key}:lock"
+        if not cache.add(lock_key, True, timeout=5 * 60):
+            return
+        try:
+            scorm_root = self.scorm_location()
+            try:
+                bucket_dirs, _ = self.storage.listdir(scorm_root)
+            except FileNotFoundError:
+                bucket_dirs = []
+
+            own_bucket = os.path.basename(self.extract_folder_base_path)
+            for bucket in bucket_dirs:
+                candidate = os.path.join(scorm_root, bucket, sha1)
+                if bucket == own_bucket or not self.storage.exists(
+                    os.path.join(candidate, "imsmanifest.xml")
+                ):
+                    continue
+                try:
+                    self._copy_storage_tree(candidate, self.extract_folder_path)
+                except Exception:  # pylint: disable=broad-except
+                    logger.exception(
+                        "Failed to rehydrate SCORM extract folder for %s from %s",
+                        self.scope_ids.usage_id, candidate,
+                    )
+                    break
+                logger.info(
+                    "Rehydrated SCORM extract folder for %s from %s",
+                    self.scope_ids.usage_id, candidate,
+                )
+                cache.set(cache_key, True, timeout=None)
+                return
+            cache.set(cache_key, False, timeout=60 * 60)
+        finally:
+            cache.delete(lock_key)
+
+    def _copy_storage_tree(self, src_root, dst_root):
+        """
+        Recursively copy every file under ``src_root`` to ``dst_root``
+        using the Django storage API, so this works on S3 and filesystem
+        backends alike. imsmanifest.xml is written last and marks the copy
+        as complete.
+        """
+        manifest = os.path.join(src_root, "imsmanifest.xml")
+        stack, paths = [src_root], []
+        while stack:
+            cur = stack.pop()
+            try:
+                dirs, files = self.storage.listdir(cur)
+            except FileNotFoundError:
+                continue
+            stack.extend(os.path.join(cur, d) for d in dirs)
+            paths.extend(os.path.join(cur, f) for f in files)
+        for src_path in sorted(paths, key=lambda path: path == manifest):
+            dst_path = os.path.join(dst_root, os.path.relpath(src_path, src_root))
+            with self.storage.open(src_path, "rb") as src_fh:
+                self.storage.save(dst_path, ContentFile(src_fh.read()))
+
     @property
     def index_page_url(self):
         if not self.package_meta or not self.index_page_path:
             return ""
+
+        self._rehydrate_extract_folder_if_missing()
         
         # Serve assets by proxying them through the LMS by default
         if self.xblock_settings.get("PROXY_ASSETS_LMS", True):

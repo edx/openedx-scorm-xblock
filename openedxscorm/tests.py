@@ -1,14 +1,50 @@
 # -*- coding: utf-8 -*-
+import io
 import json
 import unittest
 
 
 from ddt import ddt, data
+from django.core.cache.backends.locmem import LocMemCache
 from freezegun import freeze_time
 import mock
 from xblock.field_data import DictFieldData
 
 from .scormxblock import ScormError, ScormXBlock
+
+SHA1 = "99cf9a90644d4d7c379748116d25db249b44a939"
+
+
+class FakeStorage:
+    """
+    In-memory storage with the subset of the Django storage API used to rehydrate SCORM folders.
+    """
+
+    def __init__(self, files):
+        self.files = dict(files)
+        self.saved = []
+        self.listdir_calls = 0
+
+    def listdir(self, path):
+        self.listdir_calls += 1
+        prefix = path.rstrip("/") + "/"
+        children = [name[len(prefix):] for name in self.files if name.startswith(prefix)]
+        if not children:
+            raise FileNotFoundError(path)
+        dirs = sorted({child.split("/")[0] for child in children if "/" in child})
+        files = sorted(child for child in children if "/" not in child)
+        return dirs, files
+
+    def exists(self, path):
+        return path in self.files
+
+    def open(self, path, mode="rb"):
+        return io.BytesIO(self.files[path])
+
+    def save(self, path, content):
+        self.files[path] = content.read()
+        self.saved.append(path)
+        return path
 
 
 @ddt
@@ -166,6 +202,109 @@ class ScormXBlockTests(unittest.TestCase):
         storage.exists.assert_called_once_with("scorm/block/sha1/assets/app.js")
         block.find_file_path.assert_called_once_with("app.js")
         storage.open.assert_called_once_with("scorm/block/sha1/fallback/app.js")
+
+    def make_rehydrate_block(self, storage):
+        """
+        Creates a block whose extract folder is scorm/dst/<SHA1>, backed by the given storage.
+        """
+        block = self.make_one(package_meta={"sha1": SHA1})
+        block._storage = storage
+        block.scorm_location = mock.Mock(return_value="scorm")
+        for name, value in (
+            ("extract_folder_base_path", "scorm/dst"),
+            ("extract_folder_path", f"scorm/dst/{SHA1}"),
+        ):
+            patcher = mock.patch.object(
+                ScormXBlock, name, new_callable=mock.PropertyMock, return_value=value
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        # LocMemCache instances share storage by name, so start each test empty.
+        test_cache = LocMemCache("scorm-rehydrate-tests", {})
+        test_cache.clear()
+        cache_patcher = mock.patch("openedxscorm.scormxblock.cache", test_cache)
+        cache_patcher.start()
+        self.addCleanup(cache_patcher.stop)
+        return block
+
+    def test_rehydrate_skips_block_that_has_its_files(self):
+        storage = FakeStorage({
+            f"scorm/dst/{SHA1}/imsmanifest.xml": b"manifest",
+            f"scorm/dst/{SHA1}/index.html": b"index",
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        block._rehydrate_extract_folder_if_missing()
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(storage.listdir_calls, 0)
+        self.assertEqual(storage.saved, [])
+
+    def test_rehydrate_caches_miss_when_nothing_to_copy_from(self):
+        storage = FakeStorage({
+            "scorm/other/0000000000000000000000000000000000000000/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        block._rehydrate_extract_folder_if_missing()
+        listdir_calls = storage.listdir_calls
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(listdir_calls, 1)
+        self.assertEqual(storage.listdir_calls, 1)
+        self.assertEqual(storage.saved, [])
+
+    def test_rehydrate_finishes_copy_that_stopped_halfway(self):
+        storage = FakeStorage({
+            f"scorm/dst/{SHA1}/index.html": b"index",
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+            f"scorm/src/{SHA1}/index.html": b"index",
+            f"scorm/src/{SHA1}/assets/app.js": b"app",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(
+            sorted(storage.saved),
+            [
+                f"scorm/dst/{SHA1}/assets/app.js",
+                f"scorm/dst/{SHA1}/imsmanifest.xml",
+                f"scorm/dst/{SHA1}/index.html",
+            ],
+        )
+        self.assertEqual(storage.saved[-1], f"scorm/dst/{SHA1}/imsmanifest.xml")
+        self.assertEqual(storage.files[f"scorm/dst/{SHA1}/assets/app.js"], b"app")
+
+    def test_rehydrate_copies_from_other_block_and_caches_hit(self):
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+            f"scorm/src/{SHA1}/index.html": b"index",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        block._rehydrate_extract_folder_if_missing()
+        listdir_calls = storage.listdir_calls
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(
+            sorted(storage.saved),
+            [f"scorm/dst/{SHA1}/imsmanifest.xml", f"scorm/dst/{SHA1}/index.html"],
+        )
+        self.assertEqual(storage.listdir_calls, listdir_calls)
+
+    def test_rehydrate_skips_runtime_without_settings_service(self):
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+        block.runtime.service.return_value = None
+
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(storage.listdir_calls, 0)
+        self.assertEqual(storage.saved, [])
 
     @data(
         "",
