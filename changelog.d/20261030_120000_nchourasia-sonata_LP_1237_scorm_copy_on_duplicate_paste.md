@@ -1,0 +1,1 @@
+- [Bugfix] Copy a SCORM block's package files when it is duplicated or pasted in Studio, straight from the source block and server-side on S3, instead of searching every SCORM block's folder on first view. Re-run blocks copy from the source course's block, and the remaining fallback search is time-limited so it can't hold up a page. (by @naincy128)
