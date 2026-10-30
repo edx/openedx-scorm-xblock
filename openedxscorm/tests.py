@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import hashlib
 import io
+import itertools
 import json
 import unittest
 
@@ -363,10 +364,46 @@ class ScormXBlockTests(unittest.TestCase):
         })
         block = self.make_rehydrate_block(storage)
 
-        with mock.patch("openedxscorm.scormxblock.time.monotonic", side_effect=[0, 100]):
+        # Each clock read is 100s after the previous one, so the 20s budget
+        # runs out before the first bucket is checked.
+        clock = mock.Mock(side_effect=itertools.count(0, 100))
+        with mock.patch("openedxscorm.scormxblock.time.monotonic", clock):
             block._rehydrate_extract_folder_if_missing()
 
         self.assertEqual(storage.saved, [])
+
+    def test_rehydrate_scan_budget_from_string_setting(self):
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+        block.runtime.service.return_value.get_settings_bucket.return_value = {
+            "REHYDRATE_SCAN_SECONDS": "20",
+        }
+
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(storage.saved, [f"scorm/dst/{SHA1}/imsmanifest.xml"])
+
+    def test_post_duplicate_and_paste_survive_storage_errors(self):
+        storage = mock.Mock()
+        storage.exists.side_effect = RuntimeError("S3 is down")
+        storage.listdir.side_effect = RuntimeError("S3 is down")
+        block = self.make_rehydrate_block(storage)
+        source_item = mock.Mock()
+        type(source_item).extract_folder_path = mock.PropertyMock(
+            side_effect=RuntimeError("S3 is down")
+        )
+
+        self.assertFalse(block.studio_post_duplicate(mock.Mock(), source_item))
+        self.assertFalse(block.studio_post_duplicate(
+            mock.Mock(), mock.Mock(extract_folder_path=f"scorm/src/{SHA1}")
+        ))
+        self.assertFalse(block.studio_post_paste(
+            mock.Mock(),
+            mock.Mock(attrib={"copied_from_block": "block-v1:org+course+run+type@scorm+block@src"}),
+        ))
+        block._rehydrate_extract_folder_if_missing()
 
     def test_post_duplicate_copies_from_source_without_scanning(self):
         storage = FakeStorage({

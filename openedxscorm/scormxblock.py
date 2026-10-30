@@ -406,7 +406,15 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         copy it from the source block's folder.
         """
         if self._package_sha1() and self.runtime.service(self, "settings"):
-            self._copy_package_from(source_item.extract_folder_path)
+            try:
+                src_root = source_item.extract_folder_path
+            except Exception:  # pylint: disable=broad-except
+                # Never fail the duplicate itself: the first view retries.
+                logger.exception(
+                    "Failed to locate SCORM package of %s", source_item.scope_ids.usage_id
+                )
+            else:
+                self._copy_package_from(src_root)
         return False
 
     def studio_post_paste(self, store, source_node):
@@ -420,7 +428,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
             and self._package_sha1()
             and self.runtime.service(self, "settings")
         ):
-            self._copy_package_from(self._extract_folder_path_for(source_usage_id))
+            self._copy_package_from_block(source_usage_id)
         return False
 
     def _package_sha1(self):
@@ -445,16 +453,29 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
             )
         return os.path.join(base_path, self._package_sha1())
 
+    def _copy_package_from_block(self, usage_id):
+        """
+        Copy our package from the extract folder of the block ``usage_id``.
+        Return True if it was copied.
+        """
+        try:
+            src_root = self._extract_folder_path_for(usage_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to locate SCORM package of %s", usage_id)
+            return False
+        return self._copy_package_from(src_root)
+
     def _copy_package_from(self, src_root):
         """
         Copy the extracted package in ``src_root`` into our extract folder.
-        Return True if it was copied.
+        Return True if it was copied. Storage errors are logged, not raised,
+        so they can't fail a Studio duplicate/paste or a page render.
         """
-        if src_root == self.extract_folder_path or not self.storage.exists(
-            os.path.join(src_root, "imsmanifest.xml")
-        ):
-            return False
         try:
+            if src_root == self.extract_folder_path or not self.storage.exists(
+                os.path.join(src_root, "imsmanifest.xml")
+            ):
+                return False
             self._copy_storage_tree(src_root, self.extract_folder_path)
         except Exception:  # pylint: disable=broad-except
             logger.exception(
@@ -498,24 +519,28 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         directory. This lists every SCORM block in storage, so it gives up
         after REHYDRATE_SCAN_SECONDS rather than hold up the request.
         """
-        deadline = time.monotonic() + self.xblock_settings.get("REHYDRATE_SCAN_SECONDS", 20)
+        deadline = time.monotonic() + parse_int(
+            self.xblock_settings.get("REHYDRATE_SCAN_SECONDS"), 20
+        )
         scorm_root = self.scorm_location()
         try:
             bucket_dirs, _ = self.storage.listdir(scorm_root)
+            own_bucket = os.path.basename(self.extract_folder_base_path)
+            for bucket in bucket_dirs:
+                if time.monotonic() > deadline:
+                    logger.warning(
+                        "Gave up searching for the SCORM package of %s", self.scope_ids.usage_id
+                    )
+                    return None
+                candidate = os.path.join(scorm_root, bucket, sha1)
+                if bucket != own_bucket and self.storage.exists(
+                    os.path.join(candidate, "imsmanifest.xml")
+                ):
+                    return candidate
         except FileNotFoundError:
-            return None
-        own_bucket = os.path.basename(self.extract_folder_base_path)
-        for bucket in bucket_dirs:
-            if time.monotonic() > deadline:
-                logger.warning(
-                    "Gave up searching for the SCORM package of %s", self.scope_ids.usage_id
-                )
-                return None
-            candidate = os.path.join(scorm_root, bucket, sha1)
-            if bucket != own_bucket and self.storage.exists(
-                os.path.join(candidate, "imsmanifest.xml")
-            ):
-                return candidate
+            pass
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to search for the SCORM package of %s", self.scope_ids.usage_id)
         return None
 
     def _rehydrate_extract_folder_if_missing(self):
@@ -549,7 +574,14 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
 
         # _copy_storage_tree writes imsmanifest.xml last, so a copy that died
         # halfway is not taken for a complete one.
-        if self.storage.exists(os.path.join(self.extract_folder_path, "imsmanifest.xml")):
+        try:
+            has_package = self.storage.exists(
+                os.path.join(self.extract_folder_path, "imsmanifest.xml")
+            )
+        except Exception:  # pylint: disable=broad-except
+            logger.exception("Failed to check SCORM package of %s", self.scope_ids.usage_id)
+            return
+        if has_package:
             cache.set(cache_key, True, timeout=None)
             return
 
@@ -558,7 +590,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
             return
         try:
             for source_usage_id in self._known_source_usage_ids():
-                if self._copy_package_from(self._extract_folder_path_for(source_usage_id)):
+                if self._copy_package_from_block(source_usage_id):
                     cache.set(cache_key, True, timeout=None)
                     return
             candidate = self._scan_for_source_folder(sha1)
