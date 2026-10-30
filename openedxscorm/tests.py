@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
+import hashlib
 import io
+import itertools
 import json
 import unittest
 
@@ -8,6 +10,7 @@ from ddt import ddt, data
 from django.core.cache.backends.locmem import LocMemCache
 from freezegun import freeze_time
 import mock
+from opaque_keys.edx.keys import CourseKey, UsageKey
 from xblock.field_data import DictFieldData
 
 from .scormxblock import ScormError, ScormXBlock
@@ -24,9 +27,11 @@ class FakeStorage:
         self.files = dict(files)
         self.saved = []
         self.listdir_calls = 0
+        self.listed = []
 
     def listdir(self, path):
         self.listdir_calls += 1
+        self.listed.append(path)
         prefix = path.rstrip("/") + "/"
         children = [name[len(prefix):] for name in self.files if name.startswith(prefix)]
         if not children:
@@ -209,6 +214,7 @@ class ScormXBlockTests(unittest.TestCase):
         """
         block = self.make_one(package_meta={"sha1": SHA1})
         block._storage = storage
+        block.runtime.service.return_value.get_settings_bucket.return_value = {}
         block.scorm_location = mock.Mock(return_value="scorm")
         for name, value in (
             ("extract_folder_base_path", "scorm/dst"),
@@ -305,6 +311,182 @@ class ScormXBlockTests(unittest.TestCase):
 
         self.assertEqual(storage.listdir_calls, 0)
         self.assertEqual(storage.saved, [])
+
+    def test_rehydrate_copies_from_copied_from_block_without_scanning(self):
+        source_usage_id = "block-v1:org+course+run+type@scorm+block@src"
+        source_folder = f"scorm/{hashlib.sha1(source_usage_id.encode()).hexdigest()}/{SHA1}"
+        storage = FakeStorage({
+            f"{source_folder}/imsmanifest.xml": b"manifest",
+            f"{source_folder}/index.html": b"index",
+        })
+        block = self.make_rehydrate_block(storage)
+        block.copied_from_block = source_usage_id
+
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(
+            sorted(storage.saved),
+            [f"scorm/dst/{SHA1}/imsmanifest.xml", f"scorm/dst/{SHA1}/index.html"],
+        )
+        self.assertNotIn("scorm", storage.listed)
+
+    def test_rehydrate_copies_from_rerun_source_without_scanning(self):
+        source_usage_id = UsageKey.from_string("block-v1:org+course+run1+type@scorm+block@abc")
+        source_folder = f"scorm/{hashlib.sha1(str(source_usage_id).encode()).hexdigest()}/{SHA1}"
+        storage = FakeStorage({
+            f"{source_folder}/imsmanifest.xml": b"manifest",
+            f"{source_folder}/index.html": b"index",
+        })
+        block = self.make_rehydrate_block(storage)
+        block.scope_ids.usage_id = UsageKey.from_string(
+            "block-v1:org+course+run2+type@scorm+block@abc"
+        )
+        rerun_state = mock.Mock()
+        (
+            rerun_state.objects.filter.return_value.values_list.return_value.first.return_value
+        ) = CourseKey.from_string("course-v1:org+course+run1")
+
+        with mock.patch("openedxscorm.scormxblock.CourseRerunState", rerun_state):
+            block._rehydrate_extract_folder_if_missing()
+
+        rerun_state.objects.filter.assert_called_once_with(
+            course_key=CourseKey.from_string("course-v1:org+course+run2")
+        )
+        self.assertEqual(
+            sorted(storage.saved),
+            [f"scorm/dst/{SHA1}/imsmanifest.xml", f"scorm/dst/{SHA1}/index.html"],
+        )
+        self.assertNotIn("scorm", storage.listed)
+
+    def test_rehydrate_scan_gives_up_after_time_budget(self):
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        # Each clock read is 100s after the previous one, so the 20s budget
+        # runs out before the first bucket is checked.
+        clock = mock.Mock(side_effect=itertools.count(0, 100))
+        with mock.patch("openedxscorm.scormxblock.time.monotonic", clock):
+            block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(storage.saved, [])
+
+    def test_rehydrate_scan_budget_from_string_setting(self):
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+        block.runtime.service.return_value.get_settings_bucket.return_value = {
+            "REHYDRATE_SCAN_SECONDS": "20",
+        }
+
+        block._rehydrate_extract_folder_if_missing()
+
+        self.assertEqual(storage.saved, [f"scorm/dst/{SHA1}/imsmanifest.xml"])
+
+    def test_post_duplicate_and_paste_survive_storage_errors(self):
+        storage = mock.Mock()
+        storage.exists.side_effect = RuntimeError("S3 is down")
+        storage.listdir.side_effect = RuntimeError("S3 is down")
+        block = self.make_rehydrate_block(storage)
+        source_item = mock.Mock()
+        type(source_item).extract_folder_path = mock.PropertyMock(
+            side_effect=RuntimeError("S3 is down")
+        )
+
+        self.assertFalse(block.studio_post_duplicate(mock.Mock(), source_item))
+        self.assertFalse(block.studio_post_duplicate(
+            mock.Mock(), mock.Mock(extract_folder_path=f"scorm/src/{SHA1}")
+        ))
+        self.assertFalse(block.studio_post_paste(
+            mock.Mock(),
+            mock.Mock(attrib={"copied_from_block": "block-v1:org+course+run+type@scorm+block@src"}),
+        ))
+        block._rehydrate_extract_folder_if_missing()
+
+    def test_post_duplicate_copies_from_source_without_scanning(self):
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+            f"scorm/src/{SHA1}/index.html": b"index",
+            f"scorm/src/{SHA1}/assets/app.js": b"app",
+            f"scorm/other/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        children_handled = block.studio_post_duplicate(
+            mock.Mock(), mock.Mock(extract_folder_path=f"scorm/src/{SHA1}")
+        )
+
+        self.assertFalse(children_handled)
+        self.assertEqual(
+            sorted(storage.saved),
+            [
+                f"scorm/dst/{SHA1}/assets/app.js",
+                f"scorm/dst/{SHA1}/imsmanifest.xml",
+                f"scorm/dst/{SHA1}/index.html",
+            ],
+        )
+        self.assertEqual(storage.saved[-1], f"scorm/dst/{SHA1}/imsmanifest.xml")
+        self.assertNotIn("scorm", storage.listed)
+
+    def test_post_paste_copies_from_copied_from_block(self):
+        source_usage_id = "block-v1:org+course+run+type@scorm+block@src"
+        source_folder = f"scorm/{hashlib.sha1(source_usage_id.encode()).hexdigest()}/{SHA1}"
+        storage = FakeStorage({
+            f"{source_folder}/imsmanifest.xml": b"manifest",
+            f"{source_folder}/index.html": b"index",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        children_handled = block.studio_post_paste(
+            mock.Mock(), mock.Mock(attrib={"copied_from_block": source_usage_id})
+        )
+
+        self.assertFalse(children_handled)
+        self.assertEqual(
+            sorted(storage.saved),
+            [f"scorm/dst/{SHA1}/imsmanifest.xml", f"scorm/dst/{SHA1}/index.html"],
+        )
+
+    def test_post_paste_old_style_source_folder(self):
+        source_usage_id = "block-v1:org+course+run+type@scorm+block@src"
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        block.studio_post_paste(mock.Mock(), mock.Mock(attrib={"copied_from_block": source_usage_id}))
+
+        self.assertEqual(storage.saved, [f"scorm/dst/{SHA1}/imsmanifest.xml"])
+
+    def test_post_paste_without_source_copies_nothing(self):
+        storage = FakeStorage({
+            f"scorm/src/{SHA1}/imsmanifest.xml": b"manifest",
+        })
+        block = self.make_rehydrate_block(storage)
+
+        block.studio_post_paste(mock.Mock(), mock.Mock(attrib={}))
+
+        self.assertEqual(storage.listdir_calls, 0)
+        self.assertEqual(storage.saved, [])
+
+    def test_s3_copy_is_server_side(self):
+        block = self.make_one(package_meta={"sha1": SHA1})
+        storage = mock.Mock(default_acl="private")
+        storage._normalize_name.side_effect = lambda name: f"media/{name}"
+        storage.bucket.name = "scorm-bucket"
+        block._storage = storage
+
+        block._storage_file_copier()("scorm/src/a.js", "scorm/dst/a.js")
+
+        storage.bucket.meta.client.copy_object.assert_called_once_with(
+            Bucket="scorm-bucket",
+            Key="media/scorm/dst/a.js",
+            CopySource={"Bucket": "scorm-bucket", "Key": "media/scorm/src/a.js"},
+            ACL="private",
+        )
+        storage.open.assert_not_called()
 
     @data(
         "",
