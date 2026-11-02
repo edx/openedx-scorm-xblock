@@ -2,6 +2,7 @@ import json
 import hashlib
 import os
 import logging
+import random
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -10,7 +11,9 @@ import mimetypes
 import urllib
 from concurrent.futures import ThreadPoolExecutor
 
+from django.conf import settings as django_settings
 from django.core.cache import cache
+from django.core.exceptions import ImproperlyConfigured
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db.models import Q
@@ -49,6 +52,21 @@ try:
     from common.djangoapps.course_action_state.models import CourseRerunState
 except (ImportError, RuntimeError):
     CourseRerunState = None
+
+try:
+    from storages.utils import clean_name
+    try:
+        from storages.backends.s3 import S3Storage
+    except ImportError:
+        # django-storages < 1.14
+        from storages.backends.s3boto3 import S3Boto3Storage as S3Storage
+except (ImportError, ImproperlyConfigured):
+    # django-storages or boto3 isn't installed.
+    S3Storage = None
+
+# Write settings of the storage that S3 doesn't copy from the source object.
+# Metadata such as ContentType is copied with the object.
+S3_COPY_WRITE_ARGS = ("ACL", "ServerSideEncryption", "SSEKMSKeyId", "StorageClass")
 
 
 # Make '_' a no-op so we can scrape strings
@@ -405,16 +423,8 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         Studio duplicate copies our fields but not the extracted package, so
         copy it from the source block's folder.
         """
-        if self._package_sha1() and self.runtime.service(self, "settings"):
-            try:
-                src_root = source_item.extract_folder_path
-            except Exception:  # pylint: disable=broad-except
-                # Never fail the duplicate itself: the first view retries.
-                logger.exception(
-                    "Failed to locate SCORM package of %s", source_item.scope_ids.usage_id
-                )
-            else:
-                self._copy_package_from(src_root)
+        if self._package_sha1():
+            self._copy_package_from_block(source_item.scope_ids.usage_id)
         return False
 
     def studio_post_paste(self, store, source_node):
@@ -423,11 +433,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         the extracted package, so copy it from the block it was copied from.
         """
         source_usage_id = source_node.attrib.get("copied_from_block")
-        if (
-            source_usage_id
-            and self._package_sha1()
-            and self.runtime.service(self, "settings")
-        ):
+        if source_usage_id and self._package_sha1():
             self._copy_package_from_block(source_usage_id)
         return False
 
@@ -438,32 +444,25 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         sha1 = (self.package_meta or {}).get("sha1", "")
         return sha1 if re.fullmatch(r"[0-9a-f]{40}", sha1) else ""
 
-    def _extract_folder_path_for(self, usage_id):
-        """
-        Extract folder of another block holding our package, computed the same
-        way as ``extract_folder_base_path``.
-        """
-        usage_id = str(usage_id)
-        old_base_path = os.path.join(self.scorm_location(), usage_id.rsplit("@", 1)[-1])
-        if self.path_exists(old_base_path):
-            base_path = old_base_path
-        else:
-            base_path = os.path.join(
-                self.scorm_location(), hashlib.sha1(usage_id.encode()).hexdigest()
-            )
-        return os.path.join(base_path, self._package_sha1())
-
     def _copy_package_from_block(self, usage_id):
         """
-        Copy our package from the extract folder of the block ``usage_id``.
-        Return True if it was copied.
+        Copy our package from the block ``usage_id``. Return True if it was
+        copied.
+
+        Both of that block's possible folders are checked for our sha1, in the
+        order ``extract_folder_base_path`` prefers them: an old-style folder is
+        named after the block_id, which is shared across course runs, so it
+        may exist without holding our package.
         """
-        try:
-            src_root = self._extract_folder_path_for(usage_id)
-        except Exception:  # pylint: disable=broad-except
-            logger.exception("Failed to locate SCORM package of %s", usage_id)
-            return False
-        return self._copy_package_from(src_root)
+        block_id = getattr(usage_id, "block_id", None) or str(usage_id).rsplit("@", 1)[-1]
+        sha1 = self._package_sha1()
+        return any(
+            self._copy_package_from(os.path.join(base_path, sha1))
+            for base_path in (
+                self._old_folder_base_path(block_id),
+                self._hashed_folder_base_path(usage_id),
+            )
+        )
 
     def _copy_package_from(self, src_root):
         """
@@ -517,7 +516,9 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         """
         Search ``scorm_location()`` for another bucket holding the same sha1
         directory. This lists every SCORM block in storage, so it gives up
-        after REHYDRATE_SCAN_SECONDS rather than hold up the request.
+        after REHYDRATE_SCAN_SECONDS rather than hold up the request. Each
+        search starts at a random bucket, so a source that one search doesn't
+        reach in time can be found by a later one.
         """
         deadline = time.monotonic() + parse_int(
             self.xblock_settings.get("REHYDRATE_SCAN_SECONDS"), 20
@@ -525,8 +526,11 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         scorm_root = self.scorm_location()
         try:
             bucket_dirs, _ = self.storage.listdir(scorm_root)
+            if not bucket_dirs:
+                return None
+            start = random.randrange(len(bucket_dirs))
             own_bucket = os.path.basename(self.extract_folder_base_path)
-            for bucket in bucket_dirs:
+            for bucket in bucket_dirs[start:] + bucket_dirs[:start]:
                 if time.monotonic() > deadline:
                     logger.warning(
                         "Gave up searching for the SCORM package of %s", self.scope_ids.usage_id
@@ -549,22 +553,16 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         our sha1, copy the package from a block holding the same package.
 
         This covers blocks whose files weren't copied by studio_post_duplicate
-        or studio_post_paste (blocks copied before those hooks existed, or a
-        paste without the settings service) and course reruns, which copy
-        block metadata without touching storage. Blocks Studio recorded a
-        source for are copied from it directly; otherwise we fall back to a
-        time-limited search of all SCORM buckets.
+        or studio_post_paste (blocks copied before those hooks existed) and
+        course reruns, which copy block metadata without touching storage.
+        Blocks Studio recorded a source for are copied from it directly;
+        otherwise we fall back to a time-limited search of all SCORM buckets.
 
         The result is cached per usage_id and sha1. A miss is cached for an
         hour, so a block with nothing to copy from doesn't search on each
         view, and a lock keeps concurrent first views from copying the same
         package in parallel.
         """
-        # Without the settings service (OLX import/export, block structure
-        # collection) ``storage`` falls back to default_storage, so don't
-        # scan or cache anything from there.
-        if not self.runtime.service(self, "settings"):
-            return
         sha1 = self._package_sha1()
         if not sha1:
             return
@@ -605,8 +603,8 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         """
         Recursively copy every file under ``src_root`` to ``dst_root``
         using the Django storage API, so this works on S3 and filesystem
-        backends alike. Files are copied in parallel, and imsmanifest.xml is
-        written last and marks the copy as complete.
+        backends alike. imsmanifest.xml is written last and marks the copy
+        as complete.
         """
         manifest = os.path.join(src_root, "imsmanifest.xml")
         stack, paths = [src_root], []
@@ -619,46 +617,67 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
             stack.extend(os.path.join(cur, d) for d in dirs)
             paths.extend(os.path.join(cur, f) for f in files)
 
-        copy_file = self._storage_file_copier()
+        def dst_path(src_path):
+            return os.path.join(dst_root, os.path.relpath(src_path, src_root))
 
-        def copy_one(src_path):
-            copy_file(src_path, os.path.join(dst_root, os.path.relpath(src_path, src_root)))
-
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            # list() re-raises the first failed copy.
-            list(pool.map(copy_one, [path for path in paths if path != manifest]))
+        files = [path for path in paths if path != manifest]
+        copy_file = self._s3_file_copier()
+        if copy_file:
+            # S3 copies are server-side and hold no file contents here, so run
+            # them in parallel. list() re-raises the first failed copy.
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                list(pool.map(lambda path: copy_file(path, dst_path(path)), files))
+        else:
+            # Other storages read each whole file into memory, so copy them
+            # one at a time.
+            copy_file = self._copy_storage_file
+            for path in files:
+                copy_file(path, dst_path(path))
         if manifest in paths:
-            copy_one(manifest)
+            copy_file(manifest, dst_path(manifest))
 
-    def _storage_file_copier(self):
+    def _copy_storage_file(self, src_path, dst_path):
         """
-        Return a function that copies one file within our storage. On S3 it is
-        a server-side copy, so file contents never pass through this process.
+        Copy one file within our storage by reading and saving it.
+        """
+        with self.storage.open(src_path, "rb") as src_fh:
+            self.storage.save(dst_path, ContentFile(src_fh.read()))
+
+    def _s3_file_copier(self):
+        """
+        If our storage is S3, return a function that copies one file within
+        it server-side, so file contents never pass through this process.
+        Otherwise return None.
         """
         storage = self.storage
-        bucket = getattr(storage, "bucket", None)
-        if bucket is not None and hasattr(storage, "_normalize_name"):
-            from storages.utils import clean_name  # pylint: disable=import-outside-toplevel
+        if S3Storage is None or not isinstance(storage, S3Storage):
+            return None
+        from boto3.s3.transfer import TransferConfig  # pylint: disable=import-outside-toplevel
 
-            client = bucket.meta.client  # boto3 clients are thread-safe, resources aren't
-            extra_args = {"ACL": storage.default_acl} if getattr(storage, "default_acl", None) else {}
+        bucket_name = storage.bucket.name
+        client = storage.bucket.meta.client  # boto3 clients are thread-safe, resources aren't
+        # Managed copy switches to multipart above 8 MB, so files over the 5 GB
+        # CopyObject limit work too. We already copy files in parallel, so
+        # don't let each copy start its own threads.
+        config = TransferConfig(use_threads=False)
 
-            def s3_key(path):
-                return storage._normalize_name(clean_name(path))  # pylint: disable=protected-access
+        def s3_key(path):
+            return storage._normalize_name(clean_name(path))  # pylint: disable=protected-access
 
-            def copy_s3(src_path, dst_path):
-                client.copy_object(
-                    Bucket=bucket.name,
-                    Key=s3_key(dst_path),
-                    CopySource={"Bucket": bucket.name, "Key": s3_key(src_path)},
-                    **extra_args,
-                )
-            return copy_s3
-
-        def copy_storage(src_path, dst_path):
-            with storage.open(src_path, "rb") as src_fh:
-                storage.save(dst_path, ContentFile(src_fh.read()))
-        return copy_storage
+        def copy_s3(src_path, dst_path):
+            dst_key = s3_key(dst_path)
+            params = storage.get_object_parameters(dst_key)
+            extra_args = {arg: params[arg] for arg in S3_COPY_WRITE_ARGS if arg in params}
+            if "ACL" not in extra_args and storage.default_acl:
+                extra_args["ACL"] = storage.default_acl
+            client.copy(
+                {"Bucket": bucket_name, "Key": s3_key(src_path)},
+                bucket_name,
+                dst_key,
+                ExtraArgs=extra_args,
+                Config=config,
+            )
+        return copy_s3
 
     @property
     def index_page_url(self):
@@ -746,11 +765,23 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         # For backwards compatibility, we return the old path if the directory exists
         if self.path_exists(self.extract_old_folder_base_path):
             return self.extract_old_folder_base_path
-        sha1 = hashlib.sha1()
-        sha1.update(str(self.scope_ids.usage_id).encode())
-        hashed_usage_id = sha1.hexdigest()
-        return os.path.join(self.scorm_location(), hashed_usage_id)
-    
+        return self._hashed_folder_base_path(self.scope_ids.usage_id)
+
+    def _hashed_folder_base_path(self, usage_id):
+        """
+        Folder of the block ``usage_id``, named after a hash of its usage id.
+        """
+        return os.path.join(
+            self.scorm_location(), hashlib.sha1(str(usage_id).encode()).hexdigest()
+        )
+
+    def _old_folder_base_path(self, block_id):
+        """
+        Deprecated folder of a block, named after its block_id. See
+        ``extract_old_folder_base_path``.
+        """
+        return os.path.join(self.scorm_location(), block_id)
+
     @property
     def extract_old_folder_base_path(self):
         """
@@ -759,7 +790,7 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         them, thus causing storage conflicts.
         Only keeping this here for backwards compatibility.
         """
-        return os.path.join(self.scorm_location(), self.location.block_id)
+        return self._old_folder_base_path(self.location.block_id)
 
     def get_mode(self, data):
         if "preview" in data["url"]:
@@ -1213,10 +1244,14 @@ class ScormXBlock(XBlock, CompletableXBlockMixin):
         """
         Return a dict of settings associated to this XBlock.
         """
-        settings_service = self.runtime.service(self, "settings") or {}
-        if not settings_service:
-            return {}
-        return settings_service.get_settings_bucket(self)
+        settings_service = self.runtime.service(self, "settings")
+        if settings_service:
+            return settings_service.get_settings_bucket(self)
+        # Some runtimes don't provide the settings service, e.g. the modulestore
+        # runtime of a block Studio has just pasted. Read the same bucket as
+        # SettingsService.get_settings_bucket, so storage is right everywhere.
+        bucket_key = getattr(self, "unmixed_class", type(self)).__name__
+        return getattr(django_settings, "XBLOCK_SETTINGS", {}).get(bucket_key, {})
 
 
 def parse_int(value, default):
